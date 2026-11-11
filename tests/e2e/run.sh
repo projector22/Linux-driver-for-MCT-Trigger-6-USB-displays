@@ -20,9 +20,9 @@
 #                 PATH)
 #   T6_PYTHON     python with Pillow and numpy (default: python3)
 #
-# Results: $T6_E2E_WORK/out (console.txt, dmesg.txt, init.log, and fence/
-# and nofence/ with frames, logs and expected images).  Exit status is
-# non-zero if anything failed.
+# Results: $T6_E2E_WORK/out (console.txt, dmesg.txt, init.log, and fence/,
+# nofence/, lossless/ and always/ with frames, logs and expected images).
+# Exit status is non-zero if anything failed.
 
 set -euo pipefail
 

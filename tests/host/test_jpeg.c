@@ -160,7 +160,7 @@ static void encode_rows(const struct t6_jpeg_enc *enc, const struct image *img,
 
 	for (r = first; r <= last && r < rs->n; r++) {
 		int ret = t6_jpeg_encode_row(enc, img->px, img->pitch, img->w,
-					     img->h, r, &rs->rows[r],
+					     img->h, r, NULL, &rs->rows[r],
 					     rs->tail_cap);
 
 		CHECK(ret == 0, "encode_row %u failed: %d", r, ret);
@@ -182,7 +182,7 @@ static long encode_reference(const struct t6_jpeg_enc *enc,
 	for (my = 0; my < rows; my++) {
 		for (mx = 0; mx < cols; mx++) {
 			transform_mcu(enc, img->px, img->pitch, img->w, img->h,
-				      mx, my, mcu);
+				      mx, my, NULL, mcu);
 			encode_mcu(enc, &w, mcu, pred);
 		}
 	}
@@ -384,7 +384,7 @@ static void test_overflow(void)
 
 	row.tail = small_tail;
 	CHECK(t6_jpeg_encode_row(&enc, img.px, img.pitch, img.w, img.h, 0,
-				 &row, sizeof(small_tail)) == -ENOSPC,
+				 NULL, &row, sizeof(small_tail)) == -ENOSPC,
 	      "tiny tail buffer accepted");
 
 	encode_rows(&enc, &img, &rs, 0, rs.n - 1);
@@ -404,6 +404,142 @@ static void test_overflow(void)
 	      "short buffer accepted");
 	free(out);
 	rows_free(&rs);
+	free(img.px);
+}
+
+/* S31.32 sign-magnitude, as in struct drm_color_ctm. */
+static u64 drm_fixed(double v)
+{
+	u64 mag = (u64)((v < 0 ? -v : v) * 4294967296.0 + 0.5);
+
+	return v < 0 ? mag | (1ull << 63) : mag;
+}
+
+/* Encoding with @cm must equal encoding pixels it was already applied to. */
+static void check_color_encode(const struct t6_jpeg_enc *enc,
+			       const struct image *img,
+			       const struct t6_jpeg_color *cm, const char *what)
+{
+	struct image pre = image_new(img->w, img->h);
+	struct rowset a = rows_new(img->w, img->h), b = rows_new(img->w, img->h);
+	unsigned int x, y, r;
+
+	for (y = 0; y < img->h; y++)
+		for (x = 0; x < img->w; x++) {
+			const u8 *s = img->px + (size_t)y * img->pitch + x * 4;
+			s32 cr = s[2], cg = s[1], cb = s[0];
+
+			apply_color(cm, &cr, &cg, &cb);
+			set_px(&pre, x, y, cr, cg, cb);
+		}
+	for (r = 0; r < a.n; r++) {
+		CHECK(t6_jpeg_encode_row(enc, img->px, img->pitch, img->w,
+					 img->h, r, cm, &a.rows[r],
+					 a.tail_cap) == 0, "%s: encode failed", what);
+		CHECK(t6_jpeg_encode_row(enc, pre.px, pre.pitch, pre.w, pre.h,
+					 r, NULL, &b.rows[r], b.tail_cap) == 0,
+		      "%s: plain encode failed", what);
+		CHECK(a.rows[r].tail_bits == b.rows[r].tail_bits &&
+		      !memcmp(a.rows[r].tail, b.rows[r].tail,
+			      DIV_ROUND_UP(a.rows[r].tail_bits, 8)) &&
+		      !memcmp(a.rows[r].mcu0, b.rows[r].mcu0,
+			      sizeof(a.rows[r].mcu0)),
+		      "%s: row %u differs from pre-transformed pixels", what, r);
+	}
+	rows_free(&a);
+	rows_free(&b);
+	free(pre.px);
+}
+
+/* Colour management: the DRM CTM and GAMMA_LUT properties. */
+static void test_color(void)
+{
+	/* vivid-screen's saturation 1.6 matrix, Rec. 709 luma weights. */
+	static const double wt[3] = { 0.2126, 0.7152, 0.0722 };
+	const double sat = 1.6;
+	struct image img = image_new(100, 40);
+	struct t6_jpeg_color cm = { 0 };
+	struct t6_jpeg_enc enc;
+	u16 lut[T6_JPEG_LUT_SIZE * 4];
+	u64 drm[9];
+	s32 m[9];
+	unsigned int i;
+
+	/* CTM conversion. */
+	for (i = 0; i < 9; i++)
+		drm[i] = drm_fixed(i % 4 == 0 ? 1.0 : 0.0);
+	CHECK(!t6_jpeg_ctm_from_drm(drm, m), "identity CTM not detected");
+	CHECK(m[0] == T6_JPEG_CTM_ONE && m[1] == 0, "identity CTM converted wrong");
+	drm[1] = 1ull << 63;	/* negative zero */
+	CHECK(!t6_jpeg_ctm_from_drm(drm, m), "-0 broke identity detection");
+	drm[1] = drm_fixed(1e6);
+	t6_jpeg_ctm_from_drm(drm, m);
+	CHECK(m[1] == T6_JPEG_CTM_MAX, "huge coefficient not clamped: %d", m[1]);
+	drm[1] = drm_fixed(-1e6);
+	t6_jpeg_ctm_from_drm(drm, m);
+	CHECK(m[1] == -T6_JPEG_CTM_MAX, "huge negative not clamped: %d", m[1]);
+
+	for (i = 0; i < 9; i++)
+		drm[i] = drm_fixed((1 - sat) * wt[i % 3] + (i % 4 == 0 ? sat : 0));
+	CHECK(t6_jpeg_ctm_from_drm(drm, cm.ctm), "saturation CTM taken as identity");
+	for (i = 0; i < 9; i++) {
+		double want = ((1 - sat) * wt[i % 3] + (i % 4 == 0 ? sat : 0)) * 65536;
+
+		CHECK(cm.ctm[i] - want < 1 && want - cm.ctm[i] < 1,
+		      "CTM[%u] = %d, want %.1f", i, cm.ctm[i], want);
+	}
+
+	/* LUT conversion: the linear ramp X loads by default is the identity. */
+	for (i = 0; i < T6_JPEG_LUT_SIZE; i++) {
+		lut[i * 4 + 0] = lut[i * 4 + 1] = lut[i * 4 + 2] = i * 0x101;
+		lut[i * 4 + 3] = 0xabcd;	/* reserved: ignored */
+	}
+	CHECK(!t6_jpeg_lut_from_drm(lut, cm.lut), "identity LUT not detected");
+	/* A Night Color-like ramp: blue and green cut. */
+	for (i = 0; i < T6_JPEG_LUT_SIZE; i++) {
+		lut[i * 4 + 1] = i * 0x101 * 8 / 10;
+		lut[i * 4 + 2] = i * 0x101 / 2;
+	}
+	CHECK(t6_jpeg_lut_from_drm(lut, cm.lut), "warm LUT taken as identity");
+	CHECK(cm.lut[0][255] == 255 && cm.lut[1][255] == 204 &&
+	      cm.lut[2][255] == 127 && cm.lut[2][0] == 0,
+	      "LUT converted wrong: %u %u %u", cm.lut[0][255], cm.lut[1][255],
+	      cm.lut[2][255]);
+
+	/* Noise covers clamping at both ends. */
+	t6_jpeg_init(&enc, 90);
+	fill(&img, PAT_NOISE);
+	cm.use_ctm = true;
+	check_color_encode(&enc, &img, &cm, "CTM");
+	cm.use_ctm = false;
+	cm.use_lut = true;
+	check_color_encode(&enc, &img, &cm, "LUT");
+	cm.use_ctm = true;
+	check_color_encode(&enc, &img, &cm, "CTM+LUT");
+
+	/* Explicit identity settings change nothing. */
+	for (i = 0; i < T6_JPEG_LUT_SIZE; i++)
+		cm.lut[0][i] = cm.lut[1][i] = cm.lut[2][i] = i;
+	for (i = 0; i < 9; i++)
+		cm.ctm[i] = i % 4 == 0 ? T6_JPEG_CTM_ONE : 0;
+	{
+		struct rowset a = rows_new(img.w, img.h), b = rows_new(img.w, img.h);
+		unsigned int r;
+
+		for (r = 0; r < a.n; r++) {
+			CHECK(t6_jpeg_encode_row(&enc, img.px, img.pitch, img.w,
+						 img.h, r, &cm, &a.rows[r],
+						 a.tail_cap) == 0,
+			      "identity encode failed");
+			encode_rows(&enc, &img, &b, r, r);
+			CHECK(a.rows[r].tail_bits == b.rows[r].tail_bits &&
+			      !memcmp(a.rows[r].tail, b.rows[r].tail,
+				      DIV_ROUND_UP(a.rows[r].tail_bits, 8)),
+			      "identity colour row %u differs", r);
+		}
+		rows_free(&a);
+		rows_free(&b);
+	}
 	free(img.px);
 }
 
@@ -448,6 +584,37 @@ static int bench(void)
 	return 0;
 }
 
+static void test_bgr24(void)
+{
+	/* Two lines of three pixels with a padded pitch. */
+	static const u8 src[2][16] = {
+		{ 1, 2, 3, 0xff, 4, 5, 6, 0xff, 7, 8, 9, 0xff, 0xee, 0xee },
+		{ 10, 11, 12, 0, 255, 255, 255, 0, 0, 0, 0, 0, 0xee, 0xee },
+	};
+	struct t6_jpeg_color cm = { 0 };
+	u8 out[18];
+	unsigned int i;
+
+	t6_color_bgr24(&src[0][0], 16, 3, 2, NULL, out);
+	for (i = 0; i < 9; i++)
+		CHECK(out[i] == i + 1, "bgr24 line 0 byte %u = %u", i, out[i]);
+	CHECK(out[9] == 10 && out[12] == 255 && out[17] == 0, "bgr24 line 1");
+
+	/* Inactive colour management is a plain copy. */
+	t6_color_bgr24(&src[0][0], 16, 3, 2, &cm, out);
+	CHECK(out[0] == 1 && out[8] == 9, "bgr24 identity colour");
+
+	/* An inverting LUT, applied per channel, keeps B,G,R order. */
+	cm.use_lut = true;
+	for (i = 0; i < T6_JPEG_LUT_SIZE; i++)
+		cm.lut[0][i] = cm.lut[1][i] = cm.lut[2][i] = 255 - i;
+	cm.lut[2][1] = 100;	/* blue channel only */
+	t6_color_bgr24(&src[0][0], 16, 3, 2, &cm, out);
+	CHECK(out[0] == 100 && out[1] == 253 && out[2] == 252,
+	      "bgr24 LUT %u %u %u", out[0], out[1], out[2]);
+	CHECK(out[12] == 0 && out[15] == 255, "bgr24 LUT line 1");
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 2 && !strcmp(argv[1], "--bench"))
@@ -462,6 +629,8 @@ int main(int argc, char **argv)
 	test_matches_reference(argv[1]);
 	test_incremental();
 	test_overflow();
+	test_color();
+	test_bgr24();
 
 	if (failures) {
 		fprintf(stderr, "test_jpeg: %d failure(s)\n", failures);

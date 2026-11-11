@@ -20,6 +20,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
@@ -411,6 +412,9 @@ static int t6_crtc_atomic_check(struct drm_crtc *crtc,
 	if (new->enable && new->mode_changed &&
 	    t6_crtc_mode_valid(crtc, &new->mode) != MODE_OK)
 		return -EINVAL;
+	if (new->gamma_lut &&
+	    drm_color_lut_size(new->gamma_lut) != T6_JPEG_LUT_SIZE)
+		return -EINVAL;
 
 	/*
 	 * Only a modeset needs every plane.  Adding the primary plane to a
@@ -513,10 +517,31 @@ static void t6_crtc_atomic_disable(struct drm_crtc *crtc,
 	drm_dev_exit(idx);
 }
 
+/*
+ * The CTM and GAMMA_LUT properties: applied in software by the JPEG encoder,
+ * before the RGB to YCbCr conversion.  The stream ignores unchanged values.
+ */
+static void t6_crtc_update_color(struct t6_head *head,
+				 const struct drm_crtc_state *crtc_state)
+{
+	const struct drm_color_ctm *ctm = NULL;
+	const struct drm_color_lut *lut = NULL;
+
+	if (crtc_state->ctm)
+		ctm = crtc_state->ctm->data;
+	if (crtc_state->gamma_lut)
+		lut = crtc_state->gamma_lut->data;
+	t6_stream_set_color(head, ctm ? ctm->matrix : NULL,
+			    lut ? &lut->red : NULL);
+}
+
 static void t6_crtc_atomic_flush(struct drm_crtc *crtc,
 				 struct drm_atomic_state *state)
 {
+	struct t6_head *head = container_of(crtc, struct t6_head, crtc);
 	struct drm_pending_vblank_event *event = crtc->state->event;
+
+	t6_crtc_update_color(head, crtc->state);
 
 	if (!event)
 		return;
@@ -610,6 +635,14 @@ static int t6_head_init(struct t6_head *head)
 	if (ret)
 		return ret;
 	drm_crtc_helper_add(&head->crtc, &t6_crtc_helper_funcs);
+	/*
+	 * CTM and gamma LUT, no degamma.  X's modesetting driver offers the
+	 * CTM only on CRTCs that also have a gamma LUT.
+	 */
+	drm_crtc_enable_color_mgmt(&head->crtc, 0, true, T6_JPEG_LUT_SIZE);
+	ret = drm_mode_crtc_set_gamma_size(&head->crtc, T6_JPEG_LUT_SIZE);
+	if (ret)
+		return ret;
 
 	t6_connector_type(head->link, &connector_type, &encoder_type);
 	ret = drm_simple_encoder_init(drm, &head->encoder, encoder_type);

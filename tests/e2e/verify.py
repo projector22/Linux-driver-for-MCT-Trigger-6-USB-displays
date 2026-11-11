@@ -6,8 +6,11 @@
 usage: verify.py OUTDIR [--data t6emu_data.h]
 
 OUTDIR holds init.log, dmesg.txt and one directory per pass ("fence",
-"nofence"), each with t6emu's log.jsonl and frame JPEGs, t6drm's
-manifest.json and expected-NN.rgb images, and the driver's debugfs stats.
+"nofence", "lossless", "always"), each with t6emu's log.jsonl and frames
+(JPEG, or PPM for raw RGB24 frames), t6drm's manifest.json and
+expected-NN.rgb images, and the driver's debugfs stats.  "lossless" runs
+with lossless=1 (raw refinement after a quiet spell), "always" adds
+lossless_always=1 (every frame raw).
 
 Checks, per pass:
   * the emulator reported no protocol validation errors;
@@ -16,6 +19,10 @@ Checks, per pass:
   * fences strictly increase, and (fence pass) every frame was completed
     on the interrupt endpoint / (no-fence pass) none was;
   * every frame JPEG decodes at 1920x1080;
+  * raw frames: none in the JPEG-only passes; in "lossless" every step
+    ends on a raw frame and the burst step (two quick flushes) also carries
+    a JPEG, so the JPEG-then-refine path runs; in "always" every frame is
+    raw; raw frames must equal t6drm's images exactly (they are lossless);
   * the last frame of every t6drm step matches the image t6drm expected,
     and earlier frames of a step match either that or the previous image,
     by PSNR against thresholds calibrated with libjpeg (Pillow) at the
@@ -23,7 +30,8 @@ Checks, per pass:
   * the cursor shape upload (header type 1, 64x64, pitch 256, pixels equal
     to what t6drm drew), then position and show/hide requests, in order;
   * disabling the CRTC turns the output off;
-  * the debugfs stats agree with what the emulator received.
+  * the debugfs stats (frames, raw_frames, bytes) agree with what the
+    emulator received.
 Globally: KUnit (KTAP in dmesg) all ok, init.log has no failures, dmesg has
 no warnings, oopses, KASAN or lockdep reports.
 
@@ -212,7 +220,11 @@ def check_frames(name, d, bulk):
     return frames
 
 
-def check_steps(name, d, manifest, frames, thr):
+def is_raw(path):
+    return path.endswith(".ppm")
+
+
+def check_steps(name, d, manifest, frames, thr, mode):
     prev_img, prev_file = None, None
     for step in manifest["steps"]:
         if "expected" not in step:
@@ -230,10 +242,36 @@ def check_steps(name, d, manifest, frames, thr):
         if missing:
             fail("%s: frames %s missing" % (label, missing))
             continue
+        if mode == "lossless" and not is_raw(frames[rng[-1]]):
+            fail("%s: final frame %d is JPEG; a lossless refinement was "
+                 "due" % (label, rng[-1]))
+        if mode == "lossless" and step["what"] == "burst":
+            kinds = "".join("R" if is_raw(frames[n]) else "J" for n in rng)
+            if "J" not in kinds:
+                fail("%s: no JPEG among frames %s (%s): the JPEG-then-"
+                     "refine path was not exercised" % (label, rng, kinds))
+            else:
+                info("%s: frames %s are %s (R raw, J JPEG)" %
+                     (label, rng, kinds))
         for n in rng:
             got = np.asarray(Image.open(os.path.join(d, frames[n]))
                              .convert("RGB"))
             last = n == rng[-1]
+            if mode == "always" and not is_raw(frames[n]):
+                fail("%s: frame %d is JPEG with lossless_always" % (label, n))
+            if is_raw(frames[n]):
+                # Lossless: exactly the new image, or (not last) the old.
+                if np.array_equal(got, exp):
+                    info("%s: raw frame %d equals %s exactly" %
+                         (label, n, exp_file))
+                elif not last and prev_img is not None and \
+                        np.array_equal(got, prev_img):
+                    info("%s: raw intermediate frame %d equals the previous "
+                         "image exactly" % (label, n))
+                else:
+                    fail("%s: raw frame %d is not pixel-exact (PSNR %.2f dB "
+                         "vs %s)" % (label, n, psnr(got, exp), exp_file))
+                continue
             ref_g, thr_g = thr.get(exp_file, exp, None)
             p_g = psnr(got, exp)
             ok = p_g >= thr_g
@@ -376,7 +414,7 @@ def check_disable(name, events, manifest):
                                                          offs[0]["seq"]))
 
 
-def check_stats(name, d, bulk, fences_expected):
+def check_stats(name, d, bulk, fences_expected, mode):
     path = os.path.join(d, "stats.txt")
     if not os.path.exists(path):
         fail("%s: no debugfs stats captured" % name)
@@ -384,15 +422,26 @@ def check_stats(name, d, bulk, fences_expected):
     text = open(path).read()
     for line in text.strip().splitlines():
         info("%s: stats: %s" % (name, line))
-    m = re.search(r"head 0: .*?frames (\d+) bytes (\d+)", text)
+    m = re.search(r"head 0: .*?\bframes (\d+) raw_frames (\d+) bytes (\d+)",
+                  text)
     if not m:
         fail("%s: stats has no head 0 line" % name)
         return
-    frames, nbytes = int(m.group(1)), int(m.group(2))
+    frames, raw, nbytes = (int(g) for g in m.groups())
     sent = [b for b in bulk if b.get("head") == 0]
     if frames != len(sent):
         fail("%s: stats count %d frames, emulator received %d" %
              (name, frames, len(sent)))
+    raw_sent = sum(1 for b in sent if b.get("raw"))
+    if raw != raw_sent:
+        fail("%s: stats count %d raw frames, emulator received %d" %
+             (name, raw, raw_sent))
+    if mode is None and raw_sent:
+        fail("%s: %d raw frames with lossless off" % (name, raw_sent))
+    if mode is not None and not raw_sent:
+        fail("%s: no raw frames with lossless on" % name)
+    if mode is not None:
+        info("%s: %d of %d frames raw" % (name, raw_sent, len(sent)))
     if nbytes != sum(b["length"] for b in sent):
         fail("%s: stats count %d bytes, emulator received %d" %
              (name, nbytes, sum(b["length"] for b in sent)))
@@ -408,7 +457,7 @@ def check_stats(name, d, bulk, fences_expected):
         fail("%s: %s frames dropped" % (name, m.group(1)))
 
 
-def check_pass(out, name, fences_expected, timing, thr):
+def check_pass(out, name, fences_expected, timing, thr, mode=None):
     d = os.path.join(out, name)
     print("== pass %s" % name)
     log = os.path.join(d, "log.jsonl")
@@ -424,10 +473,10 @@ def check_pass(out, name, fences_expected, timing, thr):
     except (OSError, ValueError) as ex:
         fail("%s: no usable t6drm manifest (%s)" % (name, ex))
         return
-    check_steps(name, d, manifest, frames, thr)
+    check_steps(name, d, manifest, frames, thr, mode)
     check_cursor(name, events, manifest)
     check_disable(name, events, manifest)
-    check_stats(name, d, bulk, fences_expected)
+    check_stats(name, d, bulk, fences_expected, mode)
 
 
 # --- Global checks -----------------------------------------------------------
@@ -527,6 +576,8 @@ def main():
     check_dmesg(args.outdir)
     check_pass(args.outdir, "fence", True, timing, thr)
     check_pass(args.outdir, "nofence", False, timing, thr)
+    check_pass(args.outdir, "lossless", True, timing, thr, "lossless")
+    check_pass(args.outdir, "always", True, timing, thr, "always")
 
     print("== result: %d failure(s), %d warning(s)" % (len(failures),
                                                        len(warnings)))

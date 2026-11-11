@@ -231,6 +231,10 @@ sudo cat /sys/kernel/debug/mct_t6-*/stats
 | `jpeg_quality` | 85 | Maximum JPEG quality, 30–100. Lowered automatically while the USB link is saturated. Changeable at runtime. |
 | `encode_jobs` | 0 | Parallel encoder jobs per frame (0 = one per CPU, max 8). Changeable at runtime. |
 | `hw_cursor` | true | Use the chip's hardware cursor. Takes effect at load time only. |
+| `lossless` | -1 | Resend the settled picture as a lossless raw RGB frame: `1` on any link, `0` never, `-1` on USB 3 links only (a raw 1080p frame is 6.2 MB, too slow for USB 2). Changeable at runtime. |
+| `lossless_delay_ms` | 100 | How long the picture must be still before the lossless frame. Changeable at runtime. |
+| `lossless_min_fps` | 20 | Send scrolling and video lossless too, while lossless frames still reach this many per second (about 27 for 1080p on USB 3). Below that, motion falls back to JPEG plus a lossless frame once the picture is still. `0` = motion always JPEG. Changeable at runtime. |
+| `lossless_always` | false | Send every frame lossless, however slow (still only where `lossless` applies). Rarely needed: `lossless_min_fps` already keeps motion lossless whenever the link allows. Changeable at runtime. |
 
 Change one at runtime:
 

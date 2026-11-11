@@ -80,7 +80,12 @@ is a `-p1` diff with `a/src/...` paths.
    `t6emu --no-fence`. The emulator never reports frame completion, so this
    exercises the driver's fallback. The driver re-probes the new device
    without being reloaded.
-4. **Cleanup.** It runs `rmmod mct_t6`, saves dmesg and powers off through
+4. **Passes `lossless` and `always`.** These are the same as `fence`, but
+   with the `lossless=1` module parameter, and then also `lossless_always=1`.
+   The emulator is a High Speed device, where lossless frames are off by
+   default. The first pass exercises raw RGB24 refinement after a quiet
+   spell. The second sends every frame raw.
+5. **Cleanup.** It runs `rmmod mct_t6`, saves dmesg and powers off through
    sysrq.
 
 Every step has a bounded timeout, and outcomes go to `init.log`.
@@ -145,10 +150,14 @@ Every step has a bounded timeout, and outcomes go to `init.log`.
 3. It changes 5 rectangles and reports each with `DIRTYFB`. One rectangle is
    tiny and unaligned (37x19), one is a full-width strip, and one touches the
    bottom-right corner.
-4. It exercises the cursor with `DRM_IOCTL_MODE_CURSOR2`, using a 64x64
+4. Burst: it changes one more rectangle, reports it with `DIRTYFB`, and
+   reports the same rectangle again as soon as the first frame arrives.
+   With lossless refinement this forces raw, then JPEG, then raw, all of
+   the same image.
+5. It exercises the cursor with `DRM_IOCTL_MODE_CURSOR2`, using a 64x64
    ARGB dumb buffer: set at (100,100), move to (900,600), move partly
    off-screen to (−20,−10), then hide.
-5. It disables the CRTC.
+6. It disables the CRTC.
 
 After each screen change, `t6drm` waits until the emulator's frame count has
 been stable for 1.5 s. It then writes the expected image as raw RGB24
@@ -166,10 +175,11 @@ frame range of each step.
 | Mode set | Every mode set is 0x12 → 0x31 → 0x03 on, and the first one carries the exact 32-byte 1080p60 record from the table (read from `t6emu_data.h`) |
 | Fences | Fences strictly increase. In the `fence` pass every one is completed; in the `nofence` pass none is |
 | Frames | Every frame decodes at 1920x1080 |
+| Raw frames | Header fields match PROTOCOL.md §3.3. A raw object never overlaps an NV12 slot or the surface on screen, and JPEG objects never overlap raw ones. Raw frames are pixel-exact against the expected (or previous) image. There are none in `fence`/`nofence`, every step ends raw in `lossless`, and every frame is raw in `always` |
 | Images | See the PSNR paragraph below |
 | Cursor | See the cursor paragraph below |
 | Disable | Disabling the CRTC sends 0x03 off |
-| Stats | debugfs frame and byte counts equal what the emulator received, the fences state is right, and there are no drops or fence timeouts |
+| Stats | debugfs frame, raw-frame and byte counts equal what the emulator received, the fences state is right, and there are no drops or fence timeouts |
 
 For images, the last frame of each step must match the expected image, both
 over the whole frame and inside the changed rectangle. Earlier frames of a

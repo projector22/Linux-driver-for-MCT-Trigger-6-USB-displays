@@ -55,6 +55,8 @@ typedef int64_t s64;
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define clamp(v, lo, hi) min(max(v, lo), hi)
+#define min_t(t, a, b) min((t)(a), (t)(b))
+#define clamp_t(t, v, lo, hi) clamp((t)(v), (t)(lo), (t)(hi))
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define SZ_1M 0x00100000u

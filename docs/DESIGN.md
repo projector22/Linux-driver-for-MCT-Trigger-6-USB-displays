@@ -96,6 +96,34 @@ Three consecutive frames over budget lower the quality by 5 (minimum 30).
 quality invalidates the row cache, so it changes deliberately slowly. A frame
 too big for a 3 MiB ring object is re-encoded at once at lower quality.
 
+**Lossless refinement.** JPEG at any quality keeps 4:2:0 chroma and
+ringing around text. With `lossless` on (by default on SuperSpeed), once a
+head has been quiet for `lossless_delay_ms` the worker sends the whole frame
+as raw RGB24 (format 9, header immediately before the pixels, as the Windows
+JCD543 driver does) into one of three raw framebuffers carved off the top of
+the JPEG ring; the ring keeps at least 8 MiB. An update arriving after a quiet
+spell goes out raw at once; rapid updates stay JPEG and schedule a raw frame
+for when they stop. Quiet time is measured between damage arrivals, not from
+frame sends, so a link where a raw frame takes longer than the delay (USB 2
+with `lossless=1`) still falls back to JPEG during motion. Rows sent raw are marked stale in the JPEG row cache and
+re-encoded before the next JPEG. Raw objects exceed the URB pool, so
+`t6_send_object()` sends them in waves under one bulk header. Three raw
+failures in a row turn lossless off for the head until the next mode set.
+**Best picture first.** Rapid updates go out raw as well, for as long as raw
+frames still reach `lossless_min_fps` (default 20). Each raw frame is timed
+from conversion to the end of its transfer, fence wait included, and the
+times are averaged over about four frames (`t6_raw_cost_update()`). Above the
+frame period, motion falls back to JPEG with refinement. It returns to raw
+only once the average is below 7/8 of the period, so a cost near the limit
+doesn't flip on every frame (`t6_raw_motion_next()`). While motion is JPEG,
+the refinement frames keep the average current. Then, if JPEG frames still
+overrun the link, quality control lowers JPEG quality. The order is: raw
+always, then JPEG in motion with raw refinement, then lower JPEG quality.
+At ~36 ms per 1080p frame on SuperSpeed (~27 fps), one head stays raw
+throughout. Two heads, or USB 2 with `lossless=1`, fall back. debugfs
+`stats` shows `motion raw|jpeg` and `raw_cost_ms`. `lossless_always` skips
+both tests, so every frame is raw however slow.
+
 **Failures.** A failed transfer resynchronises the chip's bulk parser (vendor
 request `0x14`, as MCT's driver does), marks the frame's rows dirty again and
 retries after 100 ms.

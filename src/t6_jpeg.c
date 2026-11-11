@@ -238,11 +238,111 @@ static void bw_flush(struct bitwriter *w)
 
 /* --- Colour conversion -------------------------------------------------- */
 
+bool t6_jpeg_ctm_from_drm(const u64 drm[9], s32 out[9])
+{
+	bool identity = true;
+	unsigned int i;
+
+	for (i = 0; i < 9; i++) {
+		u64 mag = drm[i] & ~(1ull << 63);
+		s32 v;
+
+		/* S31.32 -> 16.16, rounded; clamp before narrowing. */
+		mag = (mag + (1u << 15)) >> 16;
+		v = (s32)min_t(u64, mag, T6_JPEG_CTM_MAX);
+		if (drm[i] >> 63)
+			v = -v;
+		out[i] = v;
+		if (v != (i % 4 == 0 ? T6_JPEG_CTM_ONE : 0))
+			identity = false;
+	}
+	return !identity;
+}
+
+/*
+ * One output channel of the colour matrix.  Coefficients are capped at 8.0,
+ * so the sum is at most 3 * 8 * 255 * 2^16 < 2^31.
+ */
+static inline s32 ctm_channel(const s32 m[3], s32 r, s32 g, s32 b)
+{
+	return clamp_t(s32, (m[0] * r + m[1] * g + m[2] * b + 32768) >> 16,
+		       0, 255);
+}
+
+bool t6_jpeg_lut_from_drm(const u16 *drm, u8 out[3][T6_JPEG_LUT_SIZE])
+{
+	bool identity = true;
+	unsigned int i, c;
+
+	for (i = 0; i < T6_JPEG_LUT_SIZE; i++)
+		for (c = 0; c < 3; c++) {
+			/* 16 to 8 bits, rounded: 0xffff -> 255. */
+			u8 v = ((u32)drm[i * 4 + c] * 255 + 32767) / 65535;
+
+			out[c][i] = v;
+			if (v != i)
+				identity = false;
+		}
+	return !identity;
+}
+
+/* Apply colour management to one pixel in place: CTM, then gamma. */
+static inline void apply_color(const struct t6_jpeg_color *cm,
+			       s32 *r, s32 *g, s32 *b)
+{
+	if (cm->use_ctm) {
+		const s32 *m = cm->ctm;
+		s32 in_r = *r, in_g = *g, in_b = *b;
+
+		*r = ctm_channel(m, in_r, in_g, in_b);
+		*g = ctm_channel(m + 3, in_r, in_g, in_b);
+		*b = ctm_channel(m + 6, in_r, in_g, in_b);
+	}
+	if (cm->use_lut) {
+		*r = cm->lut[0][*r];
+		*g = cm->lut[1][*g];
+		*b = cm->lut[2][*b];
+	}
+}
+
+void t6_color_bgr24(const u8 *src, unsigned int pitch, unsigned int width,
+		    unsigned int lines, const struct t6_jpeg_color *color,
+		    u8 *dst)
+{
+	unsigned int x, y;
+
+	if (color && !color->use_ctm && !color->use_lut)
+		color = NULL;
+
+	for (y = 0; y < lines; y++) {
+		const u8 *p = src + (size_t)y * pitch;
+
+		if (!color) {
+			for (x = 0; x < width; x++, p += 4, dst += 3) {
+				dst[0] = p[0];
+				dst[1] = p[1];
+				dst[2] = p[2];
+			}
+			continue;
+		}
+		for (x = 0; x < width; x++, p += 4, dst += 3) {
+			s32 b = p[0], g = p[1], r = p[2];
+
+			apply_color(color, &r, &g, &b);
+			dst[0] = b;
+			dst[1] = g;
+			dst[2] = r;
+		}
+	}
+}
+
 /*
  * Convert one 16x16 MCU to level-shifted YCbCr samples (JFIF / BT.601 full
  * range, 16.16 fixed point).  Chroma is subsampled by averaging 2x2 pixels;
  * because the conversion is linear, each pixel's weighted RGB is summed and
  * the 2x2 sum is scaled and rounded once at the end.
+ *
+ * If @color is set, each pixel first goes through colour management.
  *
  * Y goes into @y[0..3] (top-left, top-right, bottom-left, bottom-right) as
  * s16 (it fits in -128..127), Cb and Cr into @cb and @cr; natural order.
@@ -250,7 +350,8 @@ static void bw_flush(struct bitwriter *w)
  */
 static void load_mcu(const u8 *pixels, unsigned int pitch, unsigned int width,
 		     unsigned int height, unsigned int mx, unsigned int my,
-		     s16 y[4][64], s32 cb[64], s32 cr[64])
+		     const struct t6_jpeg_color *color, s16 y[4][64],
+		     s32 cb[64], s32 cr[64])
 {
 	unsigned int x0 = mx * T6_JPEG_MCU, y0 = my * T6_JPEG_MCU;
 	unsigned int yy, xx, k;
@@ -269,6 +370,9 @@ static void load_mcu(const u8 *pixels, unsigned int pitch, unsigned int width,
 		for (xx = 0; xx < T6_JPEG_MCU; xx++) {
 			const u8 *px = line + min(x0 + xx, width - 1) * 4;
 			s32 b = px[0], g = px[1], r = px[2];
+
+			if (color)
+				apply_color(color, &r, &g, &b);
 
 			yblk[(xx >> 3) * 64 + (xx & 7)] =
 				((19595 * r + 38470 * g + 7471 * b + 32768) >> 16) - 128;
@@ -391,13 +495,14 @@ static void transform_mcu(const struct t6_jpeg_enc *enc, const u8 *pixels,
 			  unsigned int pitch, unsigned int width,
 			  unsigned int height, unsigned int mx,
 			  unsigned int my,
+			  const struct t6_jpeg_color *color,
 			  s16 out[T6_JPEG_BLOCKS_PER_MCU][64])
 {
 	s32 cb[64], cr[64], data[64];
 	unsigned int b, k;
 
 	/* Luma is staged in @out[0..3] and transformed through @data. */
-	load_mcu(pixels, pitch, width, height, mx, my, out, cb, cr);
+	load_mcu(pixels, pitch, width, height, mx, my, color, out, cb, cr);
 	for (b = 0; b < 4; b++) {
 		for (k = 0; k < 64; k++)
 			data[k] = out[b][k];
@@ -467,6 +572,7 @@ static void encode_mcu(const struct t6_jpeg_enc *enc, struct bitwriter *w,
 int t6_jpeg_encode_row(const struct t6_jpeg_enc *enc, const u8 *pixels,
 		       unsigned int pitch, unsigned int width,
 		       unsigned int height, unsigned int mcu_row,
+		       const struct t6_jpeg_color *color,
 		       struct t6_jpeg_row *row, size_t tail_cap)
 {
 	unsigned int cols = t6_jpeg_mcu_cols(width), mx;
@@ -474,7 +580,8 @@ int t6_jpeg_encode_row(const struct t6_jpeg_enc *enc, const u8 *pixels,
 	struct bitwriter w;
 	s16 pred[3];
 
-	transform_mcu(enc, pixels, pitch, width, height, 0, mcu_row, row->mcu0);
+	transform_mcu(enc, pixels, pitch, width, height, 0, mcu_row, color,
+		      row->mcu0);
 	pred[0] = row->mcu0[3][0];
 	pred[1] = row->mcu0[4][0];
 	pred[2] = row->mcu0[5][0];
@@ -482,7 +589,7 @@ int t6_jpeg_encode_row(const struct t6_jpeg_enc *enc, const u8 *pixels,
 	bw_init(&w, row->tail, tail_cap, false);
 	for (mx = 1; mx < cols; mx++) {
 		transform_mcu(enc, pixels, pitch, width, height, mx, mcu_row,
-			      mcu);
+			      color, mcu);
 		encode_mcu(enc, &w, mcu, pred);
 		if (w.overflow)
 			return -ENOSPC;
