@@ -100,6 +100,45 @@ struct t6_jpeg_row {
 
 void t6_jpeg_init(struct t6_jpeg_enc *enc, unsigned int quality);
 
+/*
+ * Colour management, applied to each pixel before conversion to YCbCr, in
+ * the order display hardware uses: the colour transformation matrix (DRM
+ * "CTM"), then the per-channel gamma LUT (DRM "GAMMA_LUT").  This is how the
+ * driver implements those CRTC properties.
+ *
+ * The CTM is row-major 3x3 in 16.16 fixed point, out = M * (R, G, B), each
+ * output channel clamped to 0..255.
+ */
+#define T6_JPEG_CTM_ONE		(1 << 16)
+#define T6_JPEG_CTM_MAX		(8 * T6_JPEG_CTM_ONE)	/* |coefficient| cap */
+#define T6_JPEG_LUT_SIZE	256
+
+struct t6_jpeg_color {
+	bool use_ctm;
+	bool use_lut;
+	s32 ctm[9];
+	u8 lut[3][T6_JPEG_LUT_SIZE];	/* R, G, B */
+};
+
+/**
+ * t6_jpeg_ctm_from_drm() - convert a DRM CTM to the encoder's format
+ * @drm: struct drm_color_ctm matrix: S31.32 sign-magnitude, row-major
+ * @out: 16.16 coefficients, each clamped to +/- T6_JPEG_CTM_MAX
+ *
+ * Return: false if the result is the identity, so no matrix need be applied.
+ */
+bool t6_jpeg_ctm_from_drm(const u64 drm[9], s32 out[9]);
+
+/**
+ * t6_jpeg_lut_from_drm() - convert a DRM gamma LUT to the encoder's format
+ * @drm: T6_JPEG_LUT_SIZE struct drm_color_lut entries, i.e. groups of four
+ *       u16 (red, green, blue, reserved), 0..0xffff
+ * @out: 8-bit tables, R, G, B
+ *
+ * Return: false if the result is the identity, so no LUT need be applied.
+ */
+bool t6_jpeg_lut_from_drm(const u16 *drm, u8 out[3][T6_JPEG_LUT_SIZE]);
+
 /* Number of MCU rows/columns covering an image. */
 static inline unsigned int t6_jpeg_mcu_rows(unsigned int height)
 {
@@ -135,6 +174,7 @@ static inline size_t t6_jpeg_frame_max(unsigned int width, unsigned int height)
  * @width:  image width in pixels (1..65535)
  * @height: image height in pixels (1..65535)
  * @mcu_row: which row of MCUs to encode
+ * @color:  colour management to apply first, or NULL for none
  * @row:    output; @row->tail must point to @tail_cap bytes of storage
  * @tail_cap: capacity of @row->tail; t6_jpeg_row_tail_max() always suffices
  *
@@ -147,6 +187,7 @@ static inline size_t t6_jpeg_frame_max(unsigned int width, unsigned int height)
 int t6_jpeg_encode_row(const struct t6_jpeg_enc *enc, const u8 *pixels,
 		       unsigned int pitch, unsigned int width,
 		       unsigned int height, unsigned int mcu_row,
+		       const struct t6_jpeg_color *color,
 		       struct t6_jpeg_row *row, size_t tail_cap);
 
 /**
@@ -169,5 +210,16 @@ size_t t6_jpeg_write_header(const struct t6_jpeg_enc *enc, unsigned int width,
 long t6_jpeg_assemble(const struct t6_jpeg_enc *enc, unsigned int width,
 		      unsigned int height, const struct t6_jpeg_row *rows,
 		      u8 *out, size_t cap);
+
+/**
+ * t6_color_bgr24() - convert XRGB8888 lines to packed B,G,R for raw frames
+ * @src:   first pixel, XRGB8888 little-endian (B,G,R,X)
+ * @pitch: bytes between source lines
+ * @dst:   output, @width * 3 bytes per line, lines packed
+ * @color: colour management to apply, exactly as the encoder does, or NULL
+ */
+void t6_color_bgr24(const u8 *src, unsigned int pitch, unsigned int width,
+		    unsigned int lines, const struct t6_jpeg_color *color,
+		    u8 *dst);
 
 #endif /* T6_JPEG_H */

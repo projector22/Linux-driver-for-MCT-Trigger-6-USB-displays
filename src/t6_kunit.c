@@ -123,7 +123,7 @@ static void t6_test_jpeg_frame(struct kunit *test)
 					     GFP_KERNEL);
 		KUNIT_ASSERT_NOT_NULL(test, rows[r].tail);
 		KUNIT_ASSERT_EQ(test, t6_jpeg_encode_row(enc, pixels, pitch, w,
-							 h, r, &rows[r],
+							 h, r, NULL, &rows[r],
 							 t6_jpeg_row_tail_max(w)), 0);
 	}
 

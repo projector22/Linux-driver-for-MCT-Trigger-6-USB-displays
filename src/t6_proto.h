@@ -119,6 +119,7 @@ void t6_bulk_hdr_encode(u32 payload_len, u32 addr, u8 out[T6_BULK_HDR_LEN]);
 #define T6_VIDEO_CMD_FLIP_PRIMARY	3	/* head 0 */
 #define T6_VIDEO_CMD_FLIP_SECONDARY	4	/* head 1 */
 #define T6_FORMAT_NV12			6
+#define T6_FORMAT_RGB24			9	/* 3 bytes per pixel, B,G,R */
 #define T6_FORMAT_JPEG			13
 #define T6_VIDEO_FLAG_RESET_JPEG	0x80
 
@@ -171,6 +172,63 @@ static inline u32 t6_nv12_uv_offset(unsigned int width, unsigned int height)
 }
 
 bool t6_mode_fits_vram(unsigned int width, unsigned int height);
+
+/* --- Raw (lossless) frames ---------------------------------------------- */
+
+/*
+ * A raw frame is one object: the 48-byte video header immediately followed by
+ * the pixels, written so that the pixels land on the framebuffer address
+ * (the Windows driver's layout).  The chip scans the RGB24 surface out
+ * directly; nothing is decoded.  Three such framebuffers are carved off the
+ * top of the head's JPEG ring, so both kinds of frame can be mixed.
+ */
+#define T6_RAW_FB_OFFSET		0x40	/* pixels, 64-byte aligned */
+#define T6_RAW_MIN_RING			(8 * SZ_1M)	/* left for JPEG */
+#define T6_RAW_MAX_OBJECT		(T6_VIDEO_HDR_LEN + 2048 * 1200 * 3)
+
+struct t6_raw_layout {
+	u32 fb[T6_FB_SLOTS];	/* pixel addresses; header at fb - 48 */
+};
+
+static inline u32 t6_raw_pitch(unsigned int width)
+{
+	return width * 3;
+}
+
+/**
+ * t6_raw_layout() - make room for raw frames of @width x @height
+ * @l: the head's JPEG layout; on success its ring is shortened
+ * @raw: output, the three raw framebuffers
+ * Return: 0, or -ENOSPC if the frames don't fit next to a usable ring.
+ */
+int t6_raw_layout(struct t6_vram_layout *l, unsigned int width,
+		  unsigned int height, struct t6_raw_layout *raw);
+
+/*
+ * Lossless motion policy.  While the picture moves, raw frames are used for
+ * as long as they can still be delivered at the configured minimum frame
+ * rate; below it, motion goes out as JPEG and the still picture is refined
+ * with a raw frame.  @avg_ns is a running average of what one raw frame
+ * costs (conversion, fence wait and transfer), 0 if not yet measured.
+ */
+#define T6_RAW_COST_WEIGHT	4	/* average over ~4 frames */
+
+/**
+ * t6_raw_cost_update() - fold one raw frame's cost into the running average
+ * Return: the new average; the first measurement is taken as is.
+ */
+u64 t6_raw_cost_update(u64 avg_ns, u64 frame_ns);
+
+/**
+ * t6_raw_motion_next() - decide whether moving content goes out raw
+ * @cur: the current decision
+ * @avg_ns: running raw frame cost, 0 if unknown (try raw)
+ * @min_fps: lowest acceptable raw frame rate; 0 = never raw during motion
+ *
+ * Switching back to raw needs 1/8 headroom below the frame period, so a
+ * cost close to the limit doesn't flip the decision on every frame.
+ */
+bool t6_raw_motion_next(bool cur, u64 avg_ns, unsigned int min_fps);
 
 /* Ring cursor and framebuffer rotation for one head. */
 struct t6_stream_pos {

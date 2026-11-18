@@ -191,6 +191,20 @@ A 4 MiB slot holds NV12 up to about 1920×1200 or 2048×1152, which bounds the
 supported modes. 4K needs a different layout and SuperSpeed, which this driver
 does not implement.
 
+### 3.3 Raw RGB24 frames [WIN][HW]
+
+The same video header with scan-out and source format 9 (packed B,G,R, pitch
+`width * 3`, UV pitch 0, UV address = Y address), immediately followed by the
+pixels, written to `framebuffer - 48` so the pixels land on the framebuffer.
+Nothing is decoded; the chip scans the surface out directly.
+
+**[HW] 2026-11-09**, j5create dock on a SuperSpeed port, 1920x1080: a whole
+6 220 848-byte object sent **unfragmented** (one 32-byte bulk header, then the
+payload) is accepted; frame-done is reported for every raw frame (734/734
+fences, mixed JPEG and raw, 0 timeouts); ~36 ms per frame, ≈170 MB/s. JPEG and
+raw frames can be interleaved freely: each flip switches the scan-out format.
+`mct_t6` uses this for lossless refinement (DESIGN.md).
+
 Windows also places JPEGs in a ring and decodes them into triple-buffered NV12
 surfaces. It additionally uses "rectangle" objects (command 7) to patch the
 currently displayed surface **[WIN]**. `mct_t6` does not use rectangles yet.

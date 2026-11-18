@@ -82,6 +82,7 @@ static const uint32_t t6_versions[] = {
 #define VIDEO_HDR_LEN		48
 #define JPEG_PAD		1024
 #define FB_SLOTS		3
+#define FB_SLOT_SIZE		(4 * MiB)
 #define RESET_FRAMES		10	/* frames after a mode set with 0x80 */
 #define CURSOR_HDR_LEN		8
 #define CURSOR_MAX_BYTES	(CURSOR_HDR_LEN + 128 * 128 * 4)
@@ -123,7 +124,16 @@ struct head_state {
 	/* Mode set progress: 0x12, then 0x31, then 0x03 on. */
 	bool timing_set, sw_ready, output_on;
 	unsigned int width, height;
-	unsigned int frames;	/* since the last 0x12 */
+	unsigned int frames;	/* JPEG frames since the last 0x12 */
+
+	/*
+	 * Raw RGB24 frames (PROTOCOL.md 3.3): the span of VRAM they have used
+	 * since the last mode set, which JPEG ring objects must avoid, and
+	 * the surface the last flip put on screen, which no raw frame may
+	 * overwrite.
+	 */
+	uint32_t raw_lo, raw_hi;
+	uint32_t shown;
 
 	uint8_t cursor[CURSOR_MAX_BYTES];
 };
@@ -146,7 +156,7 @@ static struct {
 	struct head_state heads[T6_NUM_HEADS];
 
 	/* Frame accounting. */
-	unsigned long frames, objects, bytes, errors;
+	unsigned long frames, raw_frames, objects, bytes, errors;
 	uint32_t last_fence;
 	bool any_fence;
 
@@ -301,8 +311,9 @@ static void write_status(void)
 	f = fopen(tmp, "w");
 	if (!f)
 		return;
-	fprintf(f, "frames %lu\nobjects %lu\nbytes %lu\nerrors %lu\nlast_fence %u\n",
-		emu.frames, emu.objects, emu.bytes, emu.errors, emu.last_fence);
+	fprintf(f, "frames %lu\nraw_frames %lu\nobjects %lu\nbytes %lu\nerrors %lu\nlast_fence %u\n",
+		emu.frames, emu.raw_frames, emu.objects, emu.bytes, emu.errors,
+		emu.last_fence);
 	fclose(f);
 	rename(tmp, path);
 }
@@ -780,6 +791,8 @@ static bool vendor_out(const struct usb_ctrlrequest *c, const uint8_t *data,
 		h->width = get_le16(data + 0x08);
 		h->height = get_le16(data + 0x10);
 		h->frames = 0;
+		h->raw_lo = h->raw_hi = 0;
+		h->shown = 0;
 		sb_printf(b, ",\"head\":%u,\"table_index\":%d,\"width\":%u,\"height\":%u,\"refresh\":%u",
 			  c->wValue, idx, h->width, h->height, data[4]);
 		return true;
@@ -1048,6 +1061,102 @@ static void queue_frame_done(uint32_t fence)
 	pthread_cond_signal(&emu.int_cond);
 }
 
+static void check_fence(struct sbuf *errs, uint32_t fence)
+{
+	if (emu.any_fence && (int32_t)(fence - emu.last_fence) <= 0)
+		err_add(errs, "fence %u does not increase (last %u)", fence,
+			emu.last_fence);
+	emu.any_fence = true;
+	emu.last_fence = fence;
+}
+
+/*
+ * A raw RGB24 frame: the video header sits immediately before the pixels,
+ * which are packed B,G,R lines that the chip scans out as they are.  Saved
+ * as a binary PPM (R,G,B) so the frame can be compared exactly.
+ */
+static void handle_raw(struct head_state *h, struct sbuf *b,
+		       struct sbuf *errs, uint32_t addr, uint32_t len,
+		       const uint8_t *p, uint32_t psize, uint32_t tfmt,
+		       unsigned int ypitch, unsigned int uvpitch,
+		       uint32_t yaddr, uint32_t uvaddr, uint32_t vaddr,
+		       unsigned int flags)
+{
+	uint32_t want = h->width * 3 * h->height;
+	uint64_t end = (uint64_t)addr + len;
+	char name[64], path[4096];
+	unsigned int i, x, y;
+	FILE *f;
+
+	sb_printf(b, ",\"raw\":1");
+	if (tfmt != 9)
+		err_add(errs, "raw frame target format %u, expected 9 (RGB24)",
+			tfmt);
+	if (ypitch != h->width * 3 || uvpitch)
+		err_add(errs, "raw pitches %u/%u, expected %u/0", ypitch,
+			uvpitch, h->width * 3);
+	if (uvaddr != yaddr || vaddr)
+		err_add(errs, "raw plane addresses %u/%u, expected %u/0", uvaddr,
+			vaddr, yaddr);
+	if (flags)
+		err_add(errs, "raw frame flags 0x%02x", flags);
+	if (addr + VIDEO_HDR_LEN != yaddr)
+		err_add(errs, "raw header at %u does not end at the pixels (%u)",
+			addr, yaddr);
+	if (yaddr % 32)
+		err_add(errs, "raw surface %u not 32-byte aligned", yaddr);
+	if (addr < h->ring_base || end > h->ring_end)
+		err_add(errs, "raw object [%u, +%u) outside head region [%u, %u)",
+			addr, len, h->ring_base, h->ring_end);
+	for (i = 0; i < FB_SLOTS; i++)
+		if (addr < h->fb[i] + FB_SLOT_SIZE && end > h->fb[i])
+			err_add(errs, "raw object [%u, +%u) overlaps NV12 slot %u",
+				addr, len, i);
+	if (h->shown && yaddr == h->shown)
+		err_add(errs, "raw frame overwrites the surface on screen (%u)",
+			yaddr);
+	for (i = 36; i < 47; i++)
+		if (p[i]) {
+			err_add(errs, "reserved video header byte 0x%02x is %u",
+				i, p[i]);
+			break;
+		}
+	if (psize != len - VIDEO_HDR_LEN || psize != want) {
+		err_add(errs, "raw payload_size %u, object carries %u, mode needs %u",
+			psize, len - VIDEO_HDR_LEN, want);
+		return;
+	}
+
+	if (!h->raw_hi || addr < h->raw_lo)
+		h->raw_lo = addr;
+	if (end > h->raw_hi)
+		h->raw_hi = end;
+	h->shown = yaddr;
+
+	emu.frames++;
+	emu.raw_frames++;
+	snprintf(name, sizeof(name), "frame-%05lu.ppm", emu.frames);
+	snprintf(path, sizeof(path), "%s/%s", emu.outdir, name);
+	f = fopen(path, "wb");
+	if (f) {
+		const uint8_t *px = p + VIDEO_HDR_LEN;
+		bool ok = fprintf(f, "P6\n%u %u\n255\n", h->width,
+				  h->height) > 0;
+
+		for (y = 0; ok && y < h->height; y++)
+			for (x = 0; ok && x < h->width; x++, px += 3) {
+				uint8_t rgb[3] = { px[2], px[1], px[0] };
+
+				ok = fwrite(rgb, 1, 3, f) == 3;
+			}
+		if (fclose(f) || !ok)
+			err_add(errs, "cannot write frame file");
+	} else {
+		err_add(errs, "cannot write frame file");
+	}
+	sb_printf(b, ",\"frame\":%lu,\"file\":\"%s\"", emu.frames, name);
+}
+
 /* Validate one complete display object and save its JPEG. */
 static void handle_video(const uint8_t *hdr, const uint8_t *p, uint32_t len)
 {
@@ -1115,6 +1224,16 @@ static void handle_video(const uint8_t *hdr, const uint8_t *p, uint32_t len)
 	}
 	if (!h->output_on)
 		err_add(&errs, "flip on head %u while its output is off", head);
+	if (sfmt == 9) {
+		check_fence(&errs, fence);
+		handle_raw(h, &b, &errs, addr, len, p, psize, tfmt, ypitch,
+			   uvpitch, yaddr, uvaddr, vaddr, flags);
+		goto done;
+	}
+	if (h->raw_hi && addr < h->raw_hi &&
+	    addr + (uint64_t)len > h->raw_lo)
+		err_add(&errs, "JPEG object [%u, +%u) overlaps raw frames [%u, %u)",
+			addr, len, h->raw_lo, h->raw_hi);
 	if (addr < h->ring_base || addr + (uint64_t)len > h->ring_end)
 		err_add(&errs, "object [%u, +%u) outside head %u ring [%u, %u)",
 			addr, len, head, h->ring_base, h->ring_end);
@@ -1131,6 +1250,8 @@ static void handle_video(const uint8_t *hdr, const uint8_t *p, uint32_t len)
 		;
 	if (slot == FB_SLOTS)
 		err_add(&errs, "Y address %u is not a framebuffer slot", yaddr);
+	else
+		h->shown = yaddr;
 	if (uvaddr != yaddr + ALIGN(h->width, 32) * ALIGN(h->height, 32) +
 		      JPEG_PAD)
 		err_add(&errs, "UV address %u inconsistent with Y %u", uvaddr,
@@ -1156,11 +1277,7 @@ static void handle_video(const uint8_t *hdr, const uint8_t *p, uint32_t len)
 		err_add(&errs, "reset flag without a ring wrap");
 	h->frames++;
 
-	if (emu.any_fence && (int32_t)(fence - emu.last_fence) <= 0)
-		err_add(&errs, "fence %u does not increase (last %u)", fence,
-			emu.last_fence);
-	emu.any_fence = true;
-	emu.last_fence = fence;
+	check_fence(&errs, fence);
 
 	if (psize != len - VIDEO_HDR_LEN) {
 		err_add(&errs, "payload_size %u, object carries %u", psize,

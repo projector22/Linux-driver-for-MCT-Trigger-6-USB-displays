@@ -136,6 +136,18 @@ static long wait_frames(long before)
 	}
 }
 
+/* Wait until a frame newer than @before has arrived; no settling. */
+static void wait_first_frame(long before)
+{
+	uint64_t start = now_ms();
+
+	while (emu_frames() <= before) {
+		if (now_ms() - start > timeout_ms)
+			die("timed out waiting for a frame after %ld", before);
+		sleep_ms(5);
+	}
+}
+
 /* --- Pattern ------------------------------------------------------------- */
 
 /*
@@ -506,6 +518,43 @@ int main(int argc, char **argv)
 		printf("t6drm: DIRTYFB (%d,%d %dx%d) produced frames %ld..%ld\n",
 		       rects[i][0], rects[i][1], rects[i][2], rects[i][3],
 		       before + 1, after);
+	}
+
+	/*
+	 * Burst: draw, flush, and flush the same rectangle again the moment
+	 * the first frame lands.  With lossless refinement the first frame is
+	 * raw (after a quiet spell), the second must be a JPEG whose row cache
+	 * includes the rows that went out raw, and a raw refinement follows.
+	 * Every frame shows the same, final image.
+	 */
+	{
+		static const int burst[4] = { 300, 700, 400, 120 };
+		struct drm_clip_rect clip = {
+			.x1 = burst[0],
+			.y1 = burst[1],
+			.x2 = burst[0] + burst[2],
+			.y2 = burst[1] + burst[3],
+		};
+		struct drm_mode_fb_dirty_cmd dirty = {
+			.fb_id = scr.fb_id,
+			.num_clips = 1,
+			.clips_ptr = (uintptr_t)&clip,
+		};
+
+		fill_rect(&scr, burst[0], burst[1], burst[2], burst[3],
+			  ARRAY_SIZE(rects) + 1);
+		before = emu_frames();
+		xioctl(DRM_IOCTL_MODE_DIRTYFB, &dirty, "DIRTYFB");
+		wait_first_frame(before);
+		xioctl(DRM_IOCTL_MODE_DIRTYFB, &dirty, "DIRTYFB");
+		after = wait_frames(before);
+		snprintf(name, sizeof(name), "expected-%02u.rgb",
+			 (unsigned int)ARRAY_SIZE(rects) + 1);
+		save_expected(&scr, name);
+		manifest_step("burst", burst, before, after, name);
+		printf("t6drm: burst DIRTYFB x2 (%d,%d %dx%d) produced frames %ld..%ld\n",
+		       burst[0], burst[1], burst[2], burst[3], before + 1,
+		       after);
 	}
 
 	/* Hardware cursor: a 64x64 ARGB shape with a soft-edged disc. */

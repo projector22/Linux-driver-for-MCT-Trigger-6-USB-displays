@@ -14,7 +14,9 @@
 #   2. pass "fence":   t6emu reports frame completion; insmod mct_t6; t6drm
 #   3. stop t6emu, which unplugs the device (driver disconnect path)
 #   4. pass "nofence": t6emu --no-fence; the driver re-probes; t6drm again
-#   5. stop t6emu, rmmod mct_t6, collect dmesg, power off
+#   5. passes "lossless" and "always": as "fence", with lossless=1 and then
+#      also lossless_always=1
+#   6. stop t6emu, rmmod mct_t6, collect dmesg, power off
 #
 # Every step's outcome is appended to $T6_OUT/init.log; run.sh and
 # verify.py read it.  Nothing here may hang forever: every wait is bounded.
@@ -48,6 +50,17 @@ drm_card_bound() {
 
 drm_card_gone() {
 	! drm_card_bound
+}
+
+# Every frame sent has been acknowledged (fence passes only).  A large final
+# frame (raw RGB24 is 6 MB) can still be in flight when t6drm exits.
+fences_settled() {
+	for f in /sys/kernel/debug/mct_t6-*/stats; do
+		# "fences: sent N done M (...)"
+		set -- $(grep -h '^fences:' "$f")
+		[ $# -ge 5 ] && [ "$3" = "$5" ] && return 0
+	done
+	return 1
 }
 
 emu_pid=
@@ -89,11 +102,18 @@ run_pass() {
 	if wait_for 120 drm_card_bound; then
 		log "$name: DRM device bound"
 		timeout 900 "$T6_WORK/t6drm" --outdir "$OUTDIR" \
-			--status "$OUTDIR/emu.status" > "$OUTDIR/t6drm.out" 2>&1
+			--status "$OUTDIR/emu.status" \
+			${T6DRM_SETTLE:+--settle-ms $T6DRM_SETTLE} \
+			> "$OUTDIR/t6drm.out" 2>&1
 		rc=$?
 		cat "$OUTDIR/t6drm.out"
 		[ $rc -eq 0 ] && log "$name: t6drm ok" ||
 			log "FAIL $name: t6drm exited with status $rc"
+		case " $* " in
+		*" --no-fence "*) ;;
+		*) wait_for 30 fences_settled ||
+			log "FAIL $name: frames still unacknowledged after 30 s" ;;
+		esac
 	else
 		log "FAIL $name: no mct_t6 DRM device after 120 s"
 	fi
@@ -130,6 +150,25 @@ fi
 
 run_pass fence
 run_pass nofence --no-fence
+
+# Lossless raw RGB24 frames.  The emulator is a High Speed device, where
+# lossless is off by default, so force it: first refinement after a quiet
+# spell, then every frame raw.
+#
+# A raw 1080p frame takes seconds to send in UML.  t6drm's burst step sends
+# its second update when the first frame lands, one send time after the
+# first update; a 5 s delay keeps that inside "motion", so it goes out as
+# JPEG and is refined 5 s later.  It also exercises lossless_min_fps: a
+# raw frame that slow is far below 20 fps, so motion must fall back to JPEG.  t6drm must wait longer than that before
+# calling a step done, hence the 12 s settle (8 s when every frame is raw).
+echo 1 > /sys/module/mct_t6/parameters/lossless &&
+	echo 5000 > /sys/module/mct_t6/parameters/lossless_delay_ms &&
+	log "lossless=1 lossless_delay_ms=5000" ||
+	log "FAIL cannot set lossless"
+T6DRM_SETTLE=12000 run_pass lossless
+echo 1 > /sys/module/mct_t6/parameters/lossless_always &&
+	log "lossless_always=1" || log "FAIL cannot set lossless_always"
+T6DRM_SETTLE=8000 run_pass always
 
 if rmmod mct_t6; then
 	log "rmmod mct_t6 ok"

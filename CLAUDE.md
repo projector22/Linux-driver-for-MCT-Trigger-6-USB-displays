@@ -85,8 +85,10 @@ Live-USB gotchas:
   driver `t6sta.sys`; they never appear on the wire.
 - The dock is USB 3: its hub and Ethernet report bcdUSB 2.10. But the laptop
   port used so far (HS01 / `usb3-port1`) is **USB 2.0 only**, so everything
-  ran at 480M. The T6 itself reports bcdUSB 2.00 and may be USB 2 only inside
-  the dock. JPEG is mandatory below SuperSpeed (MCT's driver does the same).
+  ran at 480M. **[HW] 2026-11-09:** on a direct USB-C connection the T6
+  enumerates at 5000M (bcdUSB 3.20); a USB 2-only extension cable had forced
+  480M. JPEG is mandatory below SuperSpeed (MCT's driver does the same); on
+  SuperSpeed the driver adds lossless raw RGB24 frames (PROTOCOL.md §3.3).
 - Cursor shapes: slots 0–9 per head. Showing a slot replaces the shown one;
   the driver double-buffers 0/1.
 - The best protocol source is MCT's GPL reference driver

@@ -8,7 +8,8 @@
  *  - Bulk OUT (EP 0x02) carries "objects": a 32-byte header naming a video
  *    RAM address and length, then the payload.  Payloads are split into
  *    T6_BULK_CHUNK-sized URBs that are all queued at once so the host
- *    controller never idles between them.
+ *    controller never idles between them; raw frames, larger than the URB
+ *    pool, are sent in several such waves.
  *  - Interrupt IN (EP 0x83) reports hot-plug and frame-done events.  It is
  *    kept permanently submitted, as MCT's drivers do.
  */
@@ -108,10 +109,11 @@ static void t6_bulk_recover(struct t6_device *t6, int err)
 int t6_send_object(struct t6_device *t6, u32 addr, const u8 *buf, u32 len)
 {
 	unsigned int pipe = t6_bulk_pipe(t6);
-	unsigned int n = DIV_ROUND_UP(len, T6_BULK_CHUNK), submitted = 0, i;
+	unsigned int submitted, i;
+	u32 off = 0;
 	int actual, ret;
 
-	if (!len || len > T6_RING_MAX_OBJECT)
+	if (!len || len > T6_RAW_MAX_OBJECT)
 		return -E2BIG;
 
 	mutex_lock(&t6->bulk_lock);
@@ -121,43 +123,49 @@ int t6_send_object(struct t6_device *t6, u32 addr, const u8 *buf, u32 len)
 			   &actual, T6_BULK_HDR_TIMEOUT_MS);
 	if (!ret && actual != T6_BULK_HDR_LEN)
 		ret = -EIO;
-	if (ret)
-		goto out;
 
-	for (i = 0; i < n; i++) {
-		u32 off = i * T6_BULK_CHUNK;
-		u32 size = min_t(u32, T6_BULK_CHUNK, len - off);
-		struct urb *urb = t6->bulk_urb[i];
+	/*
+	 * One header, then the payload.  Objects larger than the URB pool
+	 * (raw frames) go in several waves through the same URBs.
+	 */
+	while (!ret && off < len) {
+		submitted = 0;
+		for (i = 0; i < T6_BULK_URBS && off < len; i++) {
+			u32 size = min_t(u32, T6_BULK_CHUNK, len - off);
+			struct urb *urb = t6->bulk_urb[i];
 
-		memcpy(t6->bulk_chunk[i], buf + off, size);
-		usb_fill_bulk_urb(urb, t6->udev, pipe, t6->bulk_chunk[i], size,
-				  t6_bulk_complete, t6);
-		usb_anchor_urb(urb, &t6->bulk_anchor);
-		ret = usb_submit_urb(urb, GFP_KERNEL);
-		if (ret) {
-			usb_unanchor_urb(urb);
-			break;
+			memcpy(t6->bulk_chunk[i], buf + off, size);
+			usb_fill_bulk_urb(urb, t6->udev, pipe,
+					  t6->bulk_chunk[i], size,
+					  t6_bulk_complete, t6);
+			usb_anchor_urb(urb, &t6->bulk_anchor);
+			ret = usb_submit_urb(urb, GFP_KERNEL);
+			if (ret) {
+				usb_unanchor_urb(urb);
+				break;
+			}
+			submitted++;
+			off += size;
 		}
-		submitted++;
+
+		if (!usb_wait_anchor_empty_timeout(&t6->bulk_anchor,
+						   T6_BULK_TIMEOUT_MS)) {
+			usb_kill_anchored_urbs(&t6->bulk_anchor);
+			if (!ret)
+				ret = -ETIMEDOUT;
+		}
+
+		for (i = 0; i < submitted && !ret; i++) {
+			struct urb *urb = t6->bulk_urb[i];
+
+			if (urb->status)
+				ret = urb->status;
+			else if (urb->actual_length !=
+				 urb->transfer_buffer_length)
+				ret = -EIO;
+		}
 	}
 
-	if (!usb_wait_anchor_empty_timeout(&t6->bulk_anchor,
-					   T6_BULK_TIMEOUT_MS)) {
-		usb_kill_anchored_urbs(&t6->bulk_anchor);
-		if (!ret)
-			ret = -ETIMEDOUT;
-	}
-
-	for (i = 0; i < submitted && !ret; i++) {
-		struct urb *urb = t6->bulk_urb[i];
-
-		if (urb->status)
-			ret = urb->status;
-		else if (urb->actual_length != urb->transfer_buffer_length)
-			ret = -EIO;
-	}
-
-out:
 	if (ret)
 		t6_bulk_recover(t6, ret);
 	mutex_unlock(&t6->bulk_lock);
